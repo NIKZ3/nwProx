@@ -1,5 +1,16 @@
 import socket
 import _thread
+import mysql.connector
+
+config = dict()
+config["packetSize"] = 4096
+config["dbPort"] = 8080
+config["host"] = "0.0.0.0"
+config["user"] = "root"
+config["password"] = "nanagawade"
+config["database"] = "proxy"
+config["auth_plugin"] = 'mysql_native_password'
+config["serverPort"] = 8081
 
 
 class server:
@@ -12,6 +23,15 @@ class server:
         self.proxySocket.listen(10)
         self.blackListUrls = dict()
         self.blackListUsers = dict()
+
+        self.db = mysql.connector.connect(
+            host=config["host"],
+            port=config["dbPort"],
+            user=config["user"],
+            password=config["password"],
+            database=config["database"],
+            auth_plugin=config["auth_plugin"]
+        )
 
         blackListUrlFile = open('blackListUrlFile.txt', 'r')
         data = blackListUrlFile.readlines()
@@ -71,6 +91,8 @@ class server:
 
         return details
 
+    '''endpoint to serve requests'''
+
     def serveRequest(self, clientSocket, clientAddr):
         '''Creating connection to the client'''
         flag = 0
@@ -78,21 +100,21 @@ class server:
         # userDataStore can be used to udata data in database
         userDataStore = dict()
         print(clientAddr)
-        userDataStore["UserIP"] = clientAddr[0]
+        userDataStore["userIP"] = clientAddr[0]
         while 1:
 
             # Checking if user is blackListed
             if clientAddr[0] in self.blackListUsers:
-                updateToDatabase = True
                 print("User is blocked will be reported")
                 userDataStore["blackListUserAccess"] = 1
                 userDataStore["blackListUserIP"] = clientAddr[0]
+                self.addToDatabase(userDataStore)
                 break
 
             print("----------Waiting for Request----")
             try:
                 clientSocket.settimeout(5)
-                request = clientSocket.recv(4096)
+                request = clientSocket.recv(config["packetSize"])
             except socket.timeout as err:
                 print(err)
                 print("Persistent Connection Disconnected")
@@ -103,7 +125,7 @@ class server:
                 break
 
             httpRefererField = "Referer"
-            updateToDatabase = httpRefererField in request
+            updateToDatabase = not (httpRefererField in request)
 
             print("-----Modified Request--------")
             request = request.replace("Proxy-Connection:", "Connection:")
@@ -114,10 +136,11 @@ class server:
                 userDataStore["blackListUrlAccess"] = 1
                 userDataStore["blackListUrl"] = details["webserver"]
                 print("IP not allowed you will be reported")
+                self.addToDatabase(userDataStore)
                 break
 
-            userDataStore["blackListAccess"] = 0
             userDataStore["Url"] = details["webserver"]
+
             '''Creating connection to the webServer'''
             if flag == 0:
                 webServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -132,10 +155,13 @@ class server:
             webServer.sendall(request.encode())
 
             print("--------waiting for Response----")
-            data = webServer.recv(4096)
+            data = webServer.recv(config["packetSize"])
             while len(data):
                 clientSocket.send(data)
-                data = webServer.recv(4096)
+                data = webServer.recv(config["packetSize"])
+
+            if updateToDatabase == True:
+                self.addToDatabase(userDataStore)
 
         try:
             clientSocket.close()
@@ -143,16 +169,43 @@ class server:
         except:
             print(
                 "Connection to webServer was not opened or there was an error while closing the connection")
-        #reply_end = "\r\n\r\n"
+        # reply_end = "\r\n\r\n"
         # clientSocket.send(reply_end.encode())
 
-        if updateToDatabase == True:
-            self.addToDatabase(userDataStore)
+    '''Add data to database'''
 
-    #! TODO: Implementaion
     def addToDatabase(self, userDataStore):
         print("-----Adding data to database------")
 
+        dbCursor = self.db.cursor()
 
-s = server(8080)
+        if "blackListUrlAccess" in userDataStore:
+
+            query = "INSERT into blackListWebsiteVisits (userIP,url) values(%s,%s)"
+            values = (userDataStore["userIP"], userDataStore["blackListUrl"])
+            print("------Inserted Data into blackListWebsiteVisits------")
+            dbCursor.execute(query, values)
+            self.db.commit()
+            print(dbCursor.rowcount, "record inserted.")
+
+        elif "blackListUserAccess" in userDataStore:
+            query = "INSERT into blackListUserVisits (userIP) values(%s)"
+            values = (userDataStore["blackListUserIP"],)
+            print("------Inserted Data into blackListUserAccess------")
+            dbCursor.execute(query, values)
+            self.db.commit()
+            print(dbCursor.rowcount, "record inserted.")
+
+        else:
+            query = "INSERT into siteVisits (userIP,url) values(%s,%s)"
+            values = (userDataStore["userIP"], userDataStore["Url"])
+            print("------Inserted Data into siteVisits------")
+            print(values)
+            print(self.db)
+            dbCursor.execute(query, values)
+            self.db.commit()
+            print(dbCursor.rowcount, "record inserted.")
+
+
+s = server(config["serverPort"])
 s.initialiseServer()
