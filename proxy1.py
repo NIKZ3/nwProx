@@ -17,6 +17,83 @@ config["serverPort"] = 8081
 config["cacheSize"] = 20
 
 
+class DLLNode:
+    def __init__(self, key, val):
+        self.val = []
+        self.val.append(val)
+        self.key = key
+        self.prev = None
+        self.next = None
+
+    def appendVal(self, data):
+        self.val.append(data)
+
+# LRU cache class
+
+
+class LRUCache:
+
+    def __init__(self, capacity):
+        # capacity:  capacity of cache
+        # Intialize all variable
+        self.capacity = capacity
+        self.map = {}
+        self.head = DLLNode(0, 0)
+        self.tail = DLLNode(0, 0)
+        self.head.next = self.tail
+        self.tail.prev = self.head
+        self.count = 0
+
+    def deleteNode(self, node):
+        node.prev.next = node.next
+        node.next.prev = node.prev
+
+    def addToHead(self, node):
+        node.next = self.head.next
+        node.next.prev = node
+        node.prev = self.head
+        self.head.next = node
+
+    def get(self, key):
+        if key in self.map:
+            node = self.map[key]
+            result = node.val
+            self.deleteNode(node)
+            self.addToHead(node)
+            print('Got the value : {} for the key: {}'.format(result, key))
+            return result
+        print('Did not get any value for the key: {}'.format(key))
+        return -1
+
+    def set(self, key, value):
+        print('going to set the (key, value)')
+        if key in self.map:
+            node = self.map[key]
+            node.val = []
+            node.appendVal(value)
+            self.deleteNode(node)
+            self.addToHead(node)
+        else:
+            node = DLLNode(key, value)
+            self.map[key] = node
+            if self.count < self.capacity:
+                self.count += 1
+                self.addToHead(node)
+            else:
+                del self.map[self.tail.prev.key]
+                self.deleteNode(self.tail.prev)
+                self.addToHead(node)
+
+    def appendToNode(self, key, data):
+        print("---appending Data----")
+        self.map[key].appendVal(data)
+
+    def ifKeyPresent(self, key):
+        if key in self.map:
+            return True
+        return False
+
+
 class server:
 
     def __init__(self, port):
@@ -28,6 +105,7 @@ class server:
         self.blackListUrls = dict()
         self.blackListUsers = dict()
         self.cache = dict()
+        self.lruCache = LRUCache(config["cacheSize"])
         self.cacheSize = config["cacheSize"]
 
         self.db = mysql.connector.connect(
@@ -100,9 +178,19 @@ class server:
 
     def insert_if_modified(self, completeUrl, request):
 
-        cacheHeader = self.checkCache(completeUrl)
-        if(len(cacheHeader) <= 1):
+        #cacheHeader = self.checkCache(completeUrl)
+        # if(len(cacheHeader) <= 1):
+        #   return request
+
+        if not self.lruCache.ifKeyPresent(completeUrl):
             return request
+
+        responseInitial = self.lruCache.get(completeUrl)
+        print("-----initial response---------")
+        print(responseInitial[0])
+        datePos = responseInitial[0].find(b'Date')
+        date = responseInitial[0][datePos:datePos+35]
+        cacheHeader = date.decode()
         cacheHeader = cacheHeader[6:35]
         # print("----cacheHeader------")
         # print(cacheHeader)
@@ -121,32 +209,6 @@ class server:
     # get modified time of the request
     def getMtime(self):
         print("OK")
-
-    def getCacheData(self, completeUrl):
-        return self.cache[completeUrl]
-
-    # check if data present in cache if yes then send date
-    def checkCache(self, completeUrl):
-        if completeUrl in self.cache:
-            responseInitial = self.cache[completeUrl]
-            datePos = responseInitial[0].find(b'Date')
-            date = responseInitial[0][datePos:datePos+35]
-            finalDate = date.decode()
-            return finalDate
-        else:
-            return ""
-
-    def addResponseToCache(self, completeUrl, response):
-        #lines = request.decode().split("\r\n\r\n")
-
-        if completeUrl in self.cache:
-            self.cache[completeUrl].append(response)
-
-        else:
-            cacheData = []
-            cacheData.append(response)
-            self.cache[completeUrl] = cacheData
-
     '''endpoint to serve requests'''
 
     def serveRequest(self, clientSocket, clientAddr):
@@ -227,15 +289,21 @@ class server:
                     print("----cache success----")
                     # print(data)
                     print("-----sending cached data----")
-                    cacheData = self.getCacheData(details["completeUrl"])
+                    #cacheData = self.getCacheData(details["completeUrl"])
+                    cacheData = self.lruCache.get(details["completeUrl"])
                     for cacheD in cacheData:
                         clientSocket.send(cacheD)
 
                 else:
+                    if len(data) > 0:
+                        self.lruCache.set(details["completeUrl"], data)
                     while len(data):
-                        self.addResponseToCache(details["completeUrl"], data)
+                        #self.addResponseToCache(details["completeUrl"], data)
                         clientSocket.send(data)
                         data = webServer.recv(config["packetSize"])
+                        if len(data) > 0:
+                            self.lruCache.appendToNode(
+                                details["completeUrl"], data)
 
                     '''if updateToDatabase == True:
                         self.addToDatabase(userDataStore)'''
