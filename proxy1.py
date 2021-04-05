@@ -1,6 +1,9 @@
 import socket
 import _thread
 import mysql.connector
+import json
+import gzip
+from http_parser.http import HttpStream
 
 config = dict()
 config["packetSize"] = 4096
@@ -11,6 +14,7 @@ config["password"] = "nanagawade"
 config["database"] = "proxy"
 config["auth_plugin"] = 'mysql_native_password'
 config["serverPort"] = 8081
+config["cacheSize"] = 20
 
 
 class server:
@@ -23,6 +27,8 @@ class server:
         self.proxySocket.listen(10)
         self.blackListUrls = dict()
         self.blackListUsers = dict()
+        self.cache = dict()
+        self.cacheSize = config["cacheSize"]
 
         self.db = mysql.connector.connect(
             host=config["host"],
@@ -87,9 +93,59 @@ class server:
 
         details = dict()
         details["webserver"] = webserver
+        details["completeUrl"] = url
         details["port"] = port
 
         return details
+
+    def insert_if_modified(self, completeUrl, request):
+
+        cacheHeader = self.checkCache(completeUrl)
+        if(len(cacheHeader) <= 1):
+            return request
+        cacheHeader = cacheHeader[6:35]
+        # print("----cacheHeader------")
+        # print(cacheHeader)
+        lines = request.splitlines()
+        while lines[len(lines)-1] == '':
+            lines.remove('')
+
+        cacheHeader = "If-Modified-Since: " + cacheHeader
+        lines.append(cacheHeader)
+
+        request = "\r\n".join(lines) + "\r\n\r\n"
+        print("-------conditional get ------")
+        print(request)
+        return request
+
+    # get modified time of the request
+    def getMtime(self):
+        print("OK")
+
+    def getCacheData(self, completeUrl):
+        return self.cache[completeUrl]
+
+    # check if data present in cache if yes then send date
+    def checkCache(self, completeUrl):
+        if completeUrl in self.cache:
+            responseInitial = self.cache[completeUrl]
+            datePos = responseInitial[0].find(b'Date')
+            date = responseInitial[0][datePos:datePos+35]
+            finalDate = date.decode()
+            return finalDate
+        else:
+            return ""
+
+    def addResponseToCache(self, completeUrl, response):
+        #lines = request.decode().split("\r\n\r\n")
+
+        if completeUrl in self.cache:
+            self.cache[completeUrl].append(response)
+
+        else:
+            cacheData = []
+            cacheData.append(response)
+            self.cache[completeUrl] = cacheData
 
     '''endpoint to serve requests'''
 
@@ -105,42 +161,42 @@ class server:
 
             # Checking if user is blackListed
             if clientAddr[0] in self.blackListUsers:
-                print("User is blocked will be reported")
+                print("----User is blocked will be reported-----")
                 userDataStore["blackListUserAccess"] = 1
                 userDataStore["blackListUserIP"] = clientAddr[0]
                 self.addToDatabase(userDataStore)
                 break
 
-            print("----------Waiting for Request----")
+            print("----------Waiting for Request-------")
             try:
                 clientSocket.settimeout(5)
                 request = clientSocket.recv(config["packetSize"])
             except socket.timeout as err:
                 print(err)
-                print("Persistent Connection Disconnected")
+                print("------Persistent Connection Disconnected-----")
                 break
 
             request = request.decode()
             if(len(request) == 0):
                 break
-
             httpRefererField = "Referer"
             updateToDatabase = not (httpRefererField in request)
 
-            print("-----Modified Request--------")
             request = request.replace("Proxy-Connection:", "Connection:")
-            print(request)
             details = self.parseRequest(request)
+
+            # inserting if modified header if data is in cache
+            request = self.insert_if_modified(details["completeUrl"], request)
 
             if details["webserver"] in self.blackListUrls:
                 userDataStore["blackListUrlAccess"] = 1
                 userDataStore["blackListUrl"] = details["webserver"]
-                print("IP not allowed you will be reported")
+                print("----IP not allowed you will be reported----")
                 self.addToDatabase(userDataStore)
                 break
 
             userDataStore["Url"] = details["webserver"]
-
+            print(details["completeUrl"])
             '''Creating connection to the webServer'''
             if flag == 0:
                 webServer = socket.socket(socket.AF_INET, socket.SOCK_STREAM)
@@ -149,19 +205,46 @@ class server:
                     webServer.connect(
                         (details["webserver"],   details["port"]))
                     flag = 1
-                except socket.timeout as err:
+
+                except:
                     print("-----Server Connection Failed------")
                     break
-            webServer.sendall(request.encode())
 
-            print("--------waiting for Response----")
-            data = webServer.recv(config["packetSize"])
-            while len(data):
-                clientSocket.send(data)
+            try:
+                webServer.sendall(request.encode())
+            except:
+                print("----Webserver request sending failed")
+                break
+
+            try:
+                print("--------waiting for Response----")
                 data = webServer.recv(config["packetSize"])
 
-            if updateToDatabase == True:
-                self.addToDatabase(userDataStore)
+                #! TODO:-insert lat_mtime in if cases
+                #!        Add to database appropriately
+                modifiedCheck = b'304 Not Modified'
+                if data.find(modifiedCheck) >= 0:
+                    print("----cache success----")
+                    # print(data)
+                    print("-----sending cached data----")
+                    cacheData = self.getCacheData(details["completeUrl"])
+                    for cacheD in cacheData:
+                        clientSocket.send(cacheD)
+
+                else:
+                    while len(data):
+                        self.addResponseToCache(details["completeUrl"], data)
+                        clientSocket.send(data)
+                        data = webServer.recv(config["packetSize"])
+
+                    '''if updateToDatabase == True:
+                        self.addToDatabase(userDataStore)'''
+
+                if updateToDatabase == True:
+                    self.addToDatabase(userDataStore)
+            except:
+                print("Error in receiving data or sending data")
+                break
 
         try:
             clientSocket.close()
